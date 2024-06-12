@@ -1,39 +1,29 @@
-//! `GreptimeDB` sink for vector.
-//!
-//! This sink writes Vector's metric data into
-//! [GreptimeDB](https://github.com/greptimeteam/greptimedb), a cloud-native
-//! time-series database. It uses GreptimeDB's [gRPC
-//! API](https://docs.greptime.com/user-guide/write-data/grpc) and GreptimeDB's
-//! [rust client](https://github.com/GreptimeTeam/greptimedb-client-rust).
-//!
-//! This sink transforms metrics into GreptimeDB table using following rules:
-//!
-//! - Table name: `{namespace}_{metric_name}`. If the metric doesn't have a
-//! namespace, we will use metric_name for table name.
-//! - Timestamp: timestamp is stored as a column called `ts`.
-//! - Tags: metric tags are stored as string columns with its name as column
-//! name
-//! - Counter and Gauge: the value of counter and gauge are stored in a column
-//! called `val`
-//! - Set: the number of set items is stored in a column called `val`.
-//! - Distribution, Histogram and Summary, Sketch: Statistical attributes like
-//! `sum`, `count`, "max", "min", quantiles and buckets are stored as columns.
-//!
+use std::sync::Arc;
+
+use vector_lib::request_metadata::RequestMetadata;
 use vector_lib::sensitive_string::SensitiveString;
 
 use crate::sinks::prelude::*;
+use greptimedb_ingester::api::v1::auth_header::AuthScheme;
+use greptimedb_ingester::api::v1::*;
+use greptimedb_ingester::{channel_manager::*, ClientBuilder, Compression};
+use greptimedb_ingester::{Client, Database, Error as GreptimeError};
 
-use self::service::GreptimeDBRetryLogic;
+use self::logs::config::GreptimeDBLogsConfig;
+use self::metrics::GreptimeDBConfig;
 
-mod batch;
-#[cfg(all(test, feature = "greptimedb-integration-tests"))]
-mod integration_tests;
-mod request_builder;
-mod service;
-mod sink;
+// sub level implementations
+mod logs;
+mod metrics;
+
+mod request;
+
+fn default_dbname() -> String {
+    greptimedb_ingester::DEFAULT_SCHEMA_NAME.to_string()
+}
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct GreptimeDBDefaultBatchSettings;
+struct GreptimeDBDefaultBatchSettings;
 
 impl SinkBatchSettings for GreptimeDBDefaultBatchSettings {
     const MAX_EVENTS: Option<usize> = Some(20);
@@ -41,125 +31,174 @@ impl SinkBatchSettings for GreptimeDBDefaultBatchSettings {
     const TIMEOUT_SECS: f64 = 1.0;
 }
 
-fn default_dbname() -> String {
-    greptimedb_client::DEFAULT_SCHEMA_NAME.to_string()
+#[derive(Clone, Default)]
+struct GreptimeDBRetryLogic;
+
+impl RetryLogic for GreptimeDBRetryLogic {
+    type Response = GreptimeDBBatchOutput;
+    type Error = GreptimeError;
+
+    fn is_retriable_error(&self, error: &Self::Error) -> bool {
+        error.is_retriable()
+    }
 }
 
-/// Configuration items for GreptimeDB
-#[configurable_component(sink("greptimedb", "Ingest metrics data into GreptimeDB."))]
-#[derive(Clone, Debug, Derivative)]
-#[derivative(Default)]
-#[serde(deny_unknown_fields)]
-pub struct GreptimeDBConfig {
-    /// The GreptimeDB [database][database] name to connect.
-    ///
-    /// Default to `public`, the default database of GreptimeDB.
-    ///
-    /// Database can be created via `create database` statement on
-    /// GreptimeDB. If you are using GreptimeCloud, use `dbname` from the
-    /// connection information of your instance.
-    ///
-    /// [database]: https://docs.greptime.com/user-guide/concepts/key-concepts#database
-    #[configurable(metadata(docs::examples = "public"))]
-    #[derivative(Default(value = "default_dbname()"))]
-    #[serde(default = "default_dbname")]
-    pub dbname: String,
-    /// The host and port of GreptimeDB gRPC service.
-    ///
-    /// This sink uses GreptimeDB's gRPC interface for data ingestion. By
-    /// default, GreptimeDB listens to port 4001 for gRPC protocol.
-    ///
-    /// The address _must_ include a port.
-    #[configurable(metadata(docs::examples = "example.com:4001"))]
-    #[configurable(metadata(
-        docs::examples = "1nge17d2r3ns.ap-southeast-1.aws.greptime.cloud:4001"
-    ))]
-    pub endpoint: String,
-    /// The username for your GreptimeDB instance.
-    ///
-    /// This is required if your instance has authentication enabled.
-    #[configurable(metadata(docs::examples = "username"))]
-    #[serde(default)]
-    pub username: Option<String>,
-    /// The password for your GreptimeDB instance.
-    ///
-    /// This is required if your instance has authentication enabled.
-    #[configurable(metadata(docs::examples = "password"))]
-    #[serde(default)]
-    pub password: Option<SensitiveString>,
-
-    #[configurable(derived)]
-    #[serde(default)]
-    pub request: TowerRequestConfig,
-
-    #[configurable(derived)]
-    #[serde(default)]
-    pub batch: BatchConfig<GreptimeDBDefaultBatchSettings>,
-
-    #[configurable(derived)]
-    #[serde(
-        default,
-        deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::is_default"
-    )]
-    pub acknowledgements: AcknowledgementsConfig,
-
-    #[configurable(derived)]
-    pub tls: Option<TlsConfig>,
+#[derive(Debug)]
+struct GreptimeDBBatchOutput {
+    pub _item_count: u32,
+    pub metadata: RequestMetadata,
 }
 
-impl_generate_config_from_default!(GreptimeDBConfig);
+impl DriverResponse for GreptimeDBBatchOutput {
+    fn event_status(&self) -> EventStatus {
+        EventStatus::Delivered
+    }
 
-#[typetag::serde(name = "greptimedb")]
-#[async_trait::async_trait]
-impl SinkConfig for GreptimeDBConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let request_settings = self.request.into_settings();
-        let service = ServiceBuilder::new()
-            .settings(request_settings, GreptimeDBRetryLogic)
-            .service(service::GreptimeDBService::try_new(self)?);
-        let sink = sink::GreptimeDBSink {
-            service,
-            batch_settings: self.batch.into_batcher_settings()?,
+    fn events_sent(&self) -> &GroupedCountByteSize {
+        self.metadata.events_estimated_json_encoded_byte_size()
+    }
+
+    fn bytes_sent(&self) -> Option<usize> {
+        Some(self.metadata.request_encoded_size())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GreptimeDBService {
+    /// the client that connects to greptimedb
+    client: Arc<Database>,
+}
+
+fn new_client_from_config(config: &GreptimeDBServiceConfig) -> crate::Result<Client> {
+    let mut builder = ClientBuilder::default().peers(vec![&config.endpoint]);
+
+    if let Some(compression) = config.grpc_compression.as_ref() {
+        let compression = match compression.as_str() {
+            "gzip" => Compression::Gzip,
+            "zstd" => Compression::Zstd,
+            _ => {
+                warn!(message = "Unknown gRPC compression type: {compression}, disabled.");
+                Compression::None
+            }
+        };
+        builder = builder.compression(compression);
+    }
+
+    if let Some(tls_config) = &config.tls {
+        let channel_config = ChannelConfig {
+            client_tls: Some(try_from_tls_config(tls_config)?),
+            ..Default::default()
         };
 
-        let healthcheck = healthcheck(self)?;
-        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+        builder = builder
+            .channel_manager(ChannelManager::with_tls_config(channel_config).map_err(Box::new)?);
     }
 
-    fn input(&self) -> Input {
-        Input::metric()
+    Ok(builder.build())
+}
+
+fn try_from_tls_config(tls_config: &TlsConfig) -> crate::Result<ClientTlsOption> {
+    if tls_config.key_pass.is_some()
+        || tls_config.alpn_protocols.is_some()
+        || tls_config.verify_certificate.is_some()
+        || tls_config.verify_hostname.is_some()
+    {
+        warn!(message = "TlsConfig: key_pass, alpn_protocols, verify_certificate and verify_hostname are not supported by greptimedb client at the moment.");
     }
 
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
+    Ok(ClientTlsOption {
+        server_ca_cert_path: tls_config.ca_file.clone(),
+        client_cert_path: tls_config.crt_file.clone(),
+        client_key_path: tls_config.key_file.clone(),
+    })
+}
+
+impl GreptimeDBService {
+    pub fn try_new(config: impl Into<GreptimeDBServiceConfig>) -> crate::Result<Self> {
+        let config = config.into();
+
+        let grpc_client = new_client_from_config(&config)?;
+
+        let mut client = Database::new_with_dbname(&config.dbname, grpc_client);
+
+        if let (Some(username), Some(password)) = (&config.username, &config.password) {
+            client.set_auth(AuthScheme::Basic(Basic {
+                username: username.to_owned(),
+                password: password.clone().into(),
+            }))
+        };
+
+        Ok(GreptimeDBService {
+            client: Arc::new(client),
+        })
     }
 }
 
-fn healthcheck(config: &GreptimeDBConfig) -> crate::Result<super::Healthcheck> {
-    let client = service::new_client_from_config(config)?;
+struct GreptimeDBServiceConfig {
+    endpoint: String,
+    dbname: String,
+    username: Option<String>,
+    password: Option<SensitiveString>,
+    grpc_compression: Option<String>,
+    tls: Option<TlsConfig>,
+}
+
+impl From<&GreptimeDBLogsConfig> for GreptimeDBServiceConfig {
+    fn from(val: &GreptimeDBLogsConfig) -> Self {
+        GreptimeDBServiceConfig {
+            endpoint: val.endpoint.clone(),
+            dbname: val.dbname.clone(),
+            username: val.username.clone(),
+            password: val.password.clone(),
+            grpc_compression: None,
+            tls: val.tls.clone(),
+        }
+    }
+}
+
+impl From<&GreptimeDBConfig> for GreptimeDBServiceConfig {
+    fn from(val: &GreptimeDBConfig) -> Self {
+        GreptimeDBServiceConfig {
+            endpoint: val.endpoint.clone(),
+            dbname: val.dbname.clone(),
+            username: val.username.clone(),
+            password: val.password.clone(),
+            grpc_compression: val.grpc_compression.clone(),
+            tls: val.tls.clone(),
+        }
+    }
+}
+
+fn healthcheck(config: impl Into<GreptimeDBServiceConfig>) -> crate::Result<Healthcheck> {
+    let config = config.into();
+    let client = new_client_from_config(&config)?;
 
     Ok(async move { client.health_check().await.map_err(|error| error.into()) }.boxed())
 }
 
-#[cfg(test)]
-mod tests {
-    use indoc::indoc;
-
-    use super::*;
-
-    #[test]
-    fn generate_config() {
-        crate::test_util::test_generate_config::<GreptimeDBConfig>();
+fn f64_column(name: &str) -> ColumnSchema {
+    ColumnSchema {
+        column_name: name.to_owned(),
+        semantic_type: SemanticType::Field as i32,
+        datatype: ColumnDataType::Float64 as i32,
+        ..Default::default()
     }
+}
 
-    #[test]
-    fn test_config_with_username() {
-        let config = indoc! {r#"
-            endpoint = "foo-bar.ap-southeast-1.aws.greptime.cloud:4001"
-            dbname = "foo-bar"
-        "#};
+fn ts_column(name: &str) -> ColumnSchema {
+    ColumnSchema {
+        column_name: name.to_owned(),
+        semantic_type: SemanticType::Timestamp as i32,
+        datatype: ColumnDataType::TimestampMillisecond as i32,
+        ..Default::default()
+    }
+}
 
-        toml::from_str::<GreptimeDBConfig>(config).unwrap();
+fn tag_column(name: &str) -> ColumnSchema {
+    ColumnSchema {
+        column_name: name.to_owned(),
+        semantic_type: SemanticType::Tag as i32,
+        datatype: ColumnDataType::String as i32,
+        ..Default::default()
     }
 }
